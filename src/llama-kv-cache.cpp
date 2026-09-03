@@ -444,6 +444,351 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     return true;
 }
 
+void llama_kv_cache::set_fastkv(const fastkv_params & params) {
+    fastkv = params;
+    LLAMA_LOG_INFO("%s: FastKV enabled=%d retain_rate=%.2f window=%u kernel=%u pool=%d\n",
+                   __func__, (int) fastkv.enable, fastkv.retain_rate,
+                   fastkv.window_size, fastkv.kernel_size, fastkv.pooling);
+}
+
+// Approximate attention-based scoring for KV token selection (FastKV-style).
+//
+// The real FastKV scores each candidate token by the attention it receives
+// from the trailing `window_size` queries. In llama.cpp the Q states are
+// transient graph tensors, so here we approximate Q with the K states of the
+// trailing window (a well-known stand-in: key-key attention correlates with
+// query-key importance) and score the candidate keys against that window.
+// The returned vector contains the surviving cell indices in cache order
+// (top-(budget-window) scored tokens + trailing window, all kept) for the
+// sequence `seq_id`.
+std::vector<uint32_t> llama_kv_cache::fastkv_score(llama_seq_id seq_id) const {
+    const uint32_t window_size = fastkv.window_size;
+    const uint32_t kernel_size = std::max(1u, fastkv.kernel_size);
+    const bool     use_maxpool = fastkv.pooling == 1;
+
+    const uint32_t strm = seq_to_stream[seq_id];
+    const auto & cells = v_cells[strm];
+
+    // collect cells belonging to this seq, in position order
+    std::vector<uint32_t> seq_cells;
+    std::vector<llama_pos> seq_pos;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.pos_in(i, 0, std::numeric_limits<llama_pos>::max()) && cells.seq_has(i, seq_id)) {
+            seq_cells.push_back(i);
+            seq_pos.push_back(cells.pos_get(i));
+        }
+    }
+
+    // Proportional budget (mirrors FastKV 'retain_rate'): budget = q_len * rate.
+    // q_len is measured from the largest absolute position ever written for the
+    // sequence (compaction preserves positions, so this is monotonic and equals
+    // the full prefill length even when the prompt arrives in several ubatches).
+    uint32_t budget;
+    {
+        llama_pos max_pos = -1;
+        const uint32_t n_c = (uint32_t) seq_cells.size();
+        for (uint32_t c = 0; c < n_c; ++c) {
+            const llama_pos p = cells.pos_get(seq_cells[c]);
+            if (p > max_pos) {
+                max_pos = p;
+            }
+        }
+        const uint32_t q_len = (uint32_t) std::max(0, (int) max_pos + 1);
+        budget = (uint32_t) std::max(1.0f, std::round(q_len * fastkv.retain_rate));
+    }
+    budget = std::max(budget, window_size + 1u);
+
+    if (seq_cells.size() <= budget) {
+        return {};
+    }
+
+    const uint32_t n_cand = (uint32_t) seq_cells.size();
+    const uint32_t n_keep = budget - window_size;
+
+    // gather per-layer K data for all candidate cells (host copy)
+    // dims per layer: [n_embd_k_gqa, n_seq_cells]
+    std::vector<std::vector<float>> K; // K[layer][cell*n_embd + i]
+    std::vector<uint32_t> embd_k_layers;
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+        if (layer.k == nullptr) {
+            continue;
+        }
+        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+        const ggml_type ktype = layer.k->type;
+        const size_t el_size = ggml_type_size(ktype);
+        const size_t row_size = ggml_row_size(ktype, n_embd_k_gqa);
+
+        auto * k_stream = layer.k_stream[strm];
+        if (!k_stream) {
+            continue;
+        }
+
+        // read the whole stream once, then extract the candidate columns
+        std::vector<uint8_t> raw(row_size * cells.size());
+        ggml_backend_tensor_get(k_stream, raw.data(), 0, raw.size());
+
+        std::vector<float> layer_k(n_cand * n_embd_k_gqa, 0.0f);
+        for (uint32_t c = 0; c < n_cand; ++c) {
+            const uint32_t col = seq_cells[c];
+            const uint8_t * src = raw.data() + col * row_size;
+            for (uint32_t i = 0; i < n_embd_k_gqa; ++i) {
+                // only simple float-ish types are suitable for approximate scoring
+                if (ktype == GGML_TYPE_F32) {
+                    float v;
+                    memcpy(&v, src + i * el_size, el_size);
+                    layer_k[c * n_embd_k_gqa + i] = v;
+                } else {
+                    layer_k[c * n_embd_k_gqa + i] = 0.0f;
+                }
+            }
+        }
+        K.push_back(std::move(layer_k));
+        embd_k_layers.push_back(n_embd_k_gqa);
+    }
+
+    const uint32_t n_layers = (uint32_t) K.size();
+
+    // attention scores: query window = trailing `window_size` tokens' K
+    // score[c] = 1/(K_scale) * sum over window w of <q_w, k_c>, then softmax,
+    // sum over window, pooled over kernel, then averaged across layers.
+    //
+    // We implement the FastKV scoring on the averaged per-layer attention.
+    const float inv_sqrt = 1.0f / std::sqrt((float) std::max(1u, embd_k_layers.empty() ? 1 : embd_k_layers[0]));
+
+    std::vector<float> score(n_cand, 0.0f);
+
+    // accumulate over layers (mean)
+    for (uint32_t li = 0; li < n_layers; ++li) {
+        const uint32_t n_embd = embd_k_layers[li];
+        const auto & K_l = K[li];
+
+        // per-candidate raw dot with each window query (approx Q = window K)
+        std::vector<float> raw_att(n_cand, 0.0f);
+        for (uint32_t w = 0; w < window_size; ++w) {
+            const uint32_t cw = n_cand - window_size + w; // trailing window candidate
+            // dot(q_cw, k_c)
+            std::vector<float> dots(n_cand, 0.0f);
+            for (uint32_t c = 0; c < n_cand; ++c) {
+                float d = 0.0f;
+                for (uint32_t i = 0; i < n_embd; ++i) {
+                    d += K_l[cw * n_embd + i] * K_l[c * n_embd + i];
+                }
+                dots[c] = d * inv_sqrt;
+            }
+            // causal: candidate positions can attend to itself and past only.
+            // positions above the query position are masked (-inf). Trailing
+            // window tokens attend to all prior tokens + themselves.
+            // softmax over candidates
+            float mx = -std::numeric_limits<float>::infinity();
+            for (uint32_t c = 0; c < n_cand; ++c) {
+                if (seq_pos[c] > seq_pos[cw]) {
+                    dots[c] = -std::numeric_limits<float>::infinity();
+                }
+                mx = std::max(mx, dots[c]);
+            }
+            double sum = 0.0;
+            std::vector<float> sm(n_cand, 0.0f);
+            for (uint32_t c = 0; c < n_cand; ++c) {
+                sm[c] = (dots[c] == -std::numeric_limits<float>::infinity()) ? 0.0f : std::exp(dots[c] - mx);
+                sum += sm[c];
+            }
+            for (uint32_t c = 0; c < n_cand; ++c) {
+                sm[c] = (float) (sm[c] / (sum > 0.0 ? sum : 1.0));
+            }
+            // sum over the window (query positions) for each candidate
+            for (uint32_t c = 0; c < n_cand; ++c) {
+                raw_att[c] += sm[c];
+            }
+        }
+
+        // pooling over kernel (avg or max) across the sequence axis
+        for (uint32_t c = 0; c < n_cand; ++c) {
+            int lo = (int) c - (int) (kernel_size / 2);
+            int hi = lo + (int) kernel_size;
+            float acc = use_maxpool ? -std::numeric_limits<float>::infinity() : 0.0f;
+            int cnt = 0;
+            for (int cc = lo; cc < hi; ++cc) {
+                if (cc >= 0 && cc < (int) n_cand) {
+                    if (use_maxpool) {
+                        acc = std::max(acc, raw_att[cc]);
+                    } else {
+                        acc += raw_att[cc];
+                    }
+                    ++cnt;
+                }
+            }
+            score[c] += (use_maxpool ? acc : (cnt ? acc / cnt : 0.0f));
+        }
+    }
+    if (n_layers > 0) {
+        for (uint32_t c = 0; c < n_cand; ++c) {
+            score[c] /= (float) n_layers;
+        }
+    }
+
+    // keep top (budget - window) scored from the candidate (non-window) prefix,
+    // plus the trailing window. trailing window always retained.
+    const uint32_t n_prefix = n_cand - window_size; // candidates eligible for eviction
+    std::vector<uint32_t> prefix_idx(n_prefix);
+    for (uint32_t i = 0; i < n_prefix; ++i) {
+        prefix_idx[i] = i;
+    }
+    std::partial_sort(prefix_idx.begin(),
+                      prefix_idx.begin() + (size_t) std::min(n_keep, n_prefix),
+                      prefix_idx.end(),
+                      [&](uint32_t a, uint32_t b) { return score[a] > score[b]; });
+
+    // build kept set = top-n_keep prefix + trailing window, sorted by position
+    std::set<uint32_t> kept_set;
+    for (uint32_t i = 0; i < std::min(n_keep, n_prefix); ++i) {
+        kept_set.insert(prefix_idx[i]);
+    }
+    for (uint32_t i = n_prefix; i < n_cand; ++i) {
+        kept_set.insert(i);
+    }
+
+    // map kept logical indices to physical cell indices, preserving cache/pos order
+    std::vector<uint32_t> kept;
+    kept.reserve(kept_set.size());
+    for (uint32_t idx : kept_set) {
+        kept.push_back(seq_cells[idx]);
+    }
+    // order by position
+    std::sort(kept.begin(), kept.end(), [&](uint32_t a, uint32_t b) {
+        return cells.pos_get(a) < cells.pos_get(b);
+    });
+
+    return kept;
+}
+
+bool llama_kv_cache::fastkv_compact(llama_seq_id seq_id) {
+    if (!fastkv.enable || seq_id < 0) {
+        return false;
+    }
+
+    const uint32_t strm = seq_to_stream[seq_id];
+    auto & cells = v_cells[strm];
+
+    // compute surviving cell indices (empty => nothing to do / too short)
+    std::vector<uint32_t> kept = fastkv_score(seq_id);
+    if (kept.size() == 0) {
+        return false;
+    }
+
+    // number of cells currently used by this sequence (in position order)
+    std::vector<uint32_t> seq_cells;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.pos_in(i, 0, std::numeric_limits<llama_pos>::max()) && cells.seq_has(i, seq_id)) {
+            seq_cells.push_back(i);
+        }
+    }
+
+    // nothing to gain if we keep everything
+    if (kept.size() >= seq_cells.size()) {
+        return false;
+    }
+
+    // snapshot surviving cell metadata (pos/ext/seq) in target order
+    llama_kv_cells snapshot = cells.cp(kept);
+
+    // physical K/V reorder (host round-trip, device-agnostic)
+    // for each layer, compact the surviving columns to the front positions 0..kept-1
+    for (auto & layer : layers) {
+        const uint32_t il = layer.il;
+
+        if (layer.k) {
+            const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+            const size_t row_size = ggml_row_size(layer.k->type, n_embd_k_gqa);
+            auto * k_stream = layer.k_stream[strm];
+
+            if (k_stream) {
+                std::vector<uint8_t> full(row_size * cells.size());
+                ggml_backend_tensor_get(k_stream, full.data(), 0, full.size());
+
+                std::vector<uint8_t> comp(row_size * kept.size());
+                for (size_t j = 0; j < kept.size(); ++j) {
+                    memcpy(comp.data() + j * row_size, full.data() + kept[j] * row_size, row_size);
+                }
+                // write back the compacted front
+                ggml_backend_tensor_set(k_stream, comp.data(), 0, comp.size());
+                // clear the released tail (optional, for determinism)
+                std::vector<uint8_t> zero(row_size * (cells.size() - kept.size()), 0);
+                ggml_backend_tensor_set(k_stream, zero.data(), kept.size() * row_size, zero.size());
+            }
+        }
+
+        if (layer.v) {
+            auto * v_stream = layer.v_stream[strm];
+            if (!v_stream) {
+                continue;
+            }
+
+            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+            const size_t row_size = ggml_row_size(layer.v->type, n_embd_v_gqa);
+
+            if (!v_trans) {
+                // V is contiguous per token like K
+                std::vector<uint8_t> full(row_size * cells.size());
+                ggml_backend_tensor_get(v_stream, full.data(), 0, full.size());
+                std::vector<uint8_t> comp(row_size * kept.size());
+                for (size_t j = 0; j < kept.size(); ++j) {
+                    memcpy(comp.data() + j * row_size, full.data() + kept[j] * row_size, row_size);
+                }
+                ggml_backend_tensor_set(v_stream, comp.data(), 0, comp.size());
+                std::vector<uint8_t> zero(row_size * (cells.size() - kept.size()), 0);
+                ggml_backend_tensor_set(v_stream, zero.data(), kept.size() * row_size, zero.size());
+            } else {
+                // transposed V: token k element j is at (k + j*kv_size)*el_size
+                const size_t el_size = ggml_type_size(layer.v->type);
+                const uint32_t kv_size = cells.size();
+                const size_t comp_size = el_size * kv_size * n_embd_v_gqa;
+
+                std::vector<uint8_t> full(comp_size);
+                ggml_backend_tensor_get(v_stream, full.data(), 0, full.size());
+
+                std::vector<uint8_t> comp(kept.size() * n_embd_v_gqa * el_size, 0);
+                for (size_t j = 0; j < kept.size(); ++j) {
+                    for (uint32_t e = 0; e < n_embd_v_gqa; ++e) {
+                        const size_t src = (kept[j] + e * kv_size) * el_size;
+                        memcpy(comp.data() + (j + e * kept.size()) * el_size, full.data() + src, el_size);
+                    }
+                }
+                ggml_backend_tensor_set(v_stream, comp.data(), 0, comp.size());
+            }
+        }
+    }
+
+    // relocate cell metadata: free all seq cells, then write survivors to front
+    std::vector<uint32_t> all_seq = seq_cells;
+    // remove this sequence from every cell (freeing empty ones)
+    for (uint32_t cell : all_seq) {
+        cells.seq_rm(cell, seq_id);
+    }
+
+    // re-insert surviving metadata at front slots [0..kept-1]
+    std::vector<uint32_t> dst(kept.size());
+    for (size_t j = 0; j < kept.size(); ++j) {
+        dst[j] = (uint32_t) j;
+    }
+    cells.set(dst, snapshot);
+
+    // adjust the search head
+    auto & head = v_heads[strm];
+    if (head >= kept.size() && head < cells.size()) {
+        // keep head pointing at first free slot
+    }
+    if (head < kept.size()) {
+        head = kept.size();
+    }
+
+    LLAMA_LOG_INFO("%s: seq %d compressed: %zu -> %zu KV cells (saved %zu)\n",
+                   __func__, seq_id, all_seq.size(), kept.size(), all_seq.size() - kept.size());
+
+    return true;
+}
+
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {

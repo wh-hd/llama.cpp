@@ -195,6 +195,45 @@ public:
     // return empty slot_info on failure
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
+    //
+    // FastKV: redundancy-aware KV cache compression (KV top-k compression)
+    //
+    // Applies FastKV-style token selection + physical compaction on the KV cache
+    // of a single sequence after prefill. Keeps the top-(retain*window) tokens
+    // scored by approximated attention importance, plus the trailing window,
+    // and compacts the surviving K/V cells to the front of the cache while
+    // preserving their original absolute positions (RoPE stays valid since the
+    // keys are already rotated; the causal mask is position-based and does not
+    // require contiguous positions).
+    //
+    struct fastkv_params {
+        bool     enable      = false; // master switch
+        // proportional retain rate (mirrors FastKV 'retain_rate'): the per-step
+        // budget is computed as q_len * retain_rate, where q_len is the full
+        // sequence length (max absolute position). 0.5 = keep 50%.
+        float    retain_rate = 0.5f;  // 0.5 = keep 50% (FastKV default is 0.25)
+        uint32_t window_size = 8;     // number of trailing tokens always kept
+        uint32_t kernel_size = 7;     // pooling kernel for score smoothing
+        // pooling: 0 = avgpool, 1 = maxpool (mirrors FastKV 'avgpool'/'maxpool')
+        int pooling = 0;
+    };
+
+    void set_fastkv(const fastkv_params & params);
+
+    const fastkv_params & get_fastkv() const {
+        return fastkv;
+    }
+
+    // compress the KV cache of the given sequence using the FastKV scorer
+    // returns true if compaction happened, false otherwise (e.g. disabled / too short)
+    bool fastkv_compact(llama_seq_id seq_id);
+
+    // compute the surviving cell indices for the sequence under the FastKV
+    // scoring policy (top-(budget-window) + trailing window). returns {} when
+    // disabled, too short, or nothing to do.
+    std::vector<uint32_t> fastkv_score(llama_seq_id seq_id) const;
+
+
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
@@ -242,6 +281,10 @@ private:
 
     // required padding
     const uint32_t n_pad = 1;
+
+    // FastKV compression configuration (default: disabled)
+    fastkv_params fastkv;
+
 
     // SWA
     const uint32_t n_swa = 0;

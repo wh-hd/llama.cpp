@@ -2438,6 +2438,21 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             }
     }
 
+    llama_kv_cache::fastkv_params fkv;
+    fkv.enable      = params.fastkv_enable;
+    fkv.retain_rate = params.fastkv_retain_rate;
+    fkv.window_size = params.fastkv_window_size;
+    fkv.kernel_size = params.fastkv_kernel_size;
+    fkv.pooling     = params.fastkv_pooling;
+
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(res)) {
+        kv->set_fastkv(fkv);
+    } else if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(res)) {
+        if (auto * kv = hybrid->get_mem_attn()) {
+            kv->set_fastkv(fkv);
+        }
+    }
+
     return res;
 }
 

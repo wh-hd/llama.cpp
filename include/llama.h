@@ -399,6 +399,13 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
 
+        // FastKV KV-cache compression (KV top-k token selection + compaction)
+        bool     fastkv_enable      = false;
+        float    fastkv_retain_rate = 0.5f; // proportional retain (q_len*rate)
+        uint32_t fastkv_window_size = 8;
+        uint32_t fastkv_kernel_size = 7;
+        int      fastkv_pooling     = 0; // 0 = avgpool, 1 = maxpool
+
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)

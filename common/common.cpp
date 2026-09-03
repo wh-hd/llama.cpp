@@ -1727,6 +1727,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
+    cparams.fastkv_enable      = params.fastkv_enable;
+    cparams.fastkv_retain_rate = params.fastkv_retain_rate;
+    cparams.fastkv_window_size = params.fastkv_window_size;
+    cparams.fastkv_kernel_size = params.fastkv_kernel_size;
+    cparams.fastkv_pooling     = params.fastkv_pooling;
+
     return cparams;
 }
 

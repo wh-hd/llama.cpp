@@ -7,6 +7,8 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -391,6 +393,11 @@ llama_context::llama_context(
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
+        params_mem.fastkv_enable      = params.fastkv_enable;
+        params_mem.fastkv_retain_rate = params.fastkv_retain_rate;
+        params_mem.fastkv_window_size = params.fastkv_window_size;
+        params_mem.fastkv_kernel_size = params.fastkv_kernel_size;
+        params_mem.fastkv_pooling     = params.fastkv_pooling;
 
         memory.reset(model.create_memory(params_mem, cparams));
     }
@@ -1843,6 +1850,29 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 case GGML_STATUS_ALLOC_FAILED: return -2;
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+            }
+        }
+
+        // FastKV: compress the KV cache once, at the END of prefill (the last
+        // ubatch with n_tokens > 1). For proportional mode this matters: we must
+        // size the budget from the FINAL prefill length, not compress after every
+        // intermediate ubatch (which would over-prune across multiple crops).
+        // Works on both plain KV caches and the attention KV cache of hybrid
+        // architectures (e.g. Qwen3.6).
+        const bool last_ubatch = (n_tokens_prev + (int64_t) ubatch.n_tokens >= n_tokens_all);
+        if (ubatch.n_tokens > 1 && last_ubatch) {
+            llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+            if (!kv) {
+                if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+                    kv = hybrid->get_mem_attn();
+                }
+            }
+            if (kv && kv->get_fastkv().enable) {
+                LLAMA_LOG_INFO("%s: FastKV trigger on %u seqs (n_tokens=%u, last prefill ubatch)\n",
+                               __func__, ubatch.n_seqs_unq, ubatch.n_tokens);
+                for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+                    kv->fastkv_compact(ubatch.seq_id_unq[s]);
+                }
             }
         }
 
@@ -3541,8 +3571,13 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
-        /*.sampler                     =*/ nullptr,
-        /*.n_sampler                   =*/ 0,
+        /*.fastkv_enable               =*/ false,
+        /*.fastkv_retain_rate          =*/ 0.5f,
+        /*.fastkv_window_size          =*/ 8,
+        /*.fastkv_kernel_size          =*/ 7,
+        /*.fastkv_pooling              =*/ 0,
+        /*.samplers                    =*/ nullptr,
+        /*.n_samplers                  =*/ 0,
         /*.ctx_other                   =*/ nullptr,
     };
 

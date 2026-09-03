@@ -25,6 +25,13 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    // FastKV KV-cache compression
+    bool     fastkv_enable      = false;
+    float    fastkv_retain_rate = 0.5f;   // proportional retain (q_len*rate)
+    uint32_t fastkv_window_size = 8;
+    uint32_t fastkv_kernel_size = 7;
+    int      fastkv_pooling     = 0;
 };
 
 enum llama_memory_status {

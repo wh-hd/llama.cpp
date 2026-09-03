@@ -577,6 +577,13 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    // FastKV KV-cache compression (KV top-k token selection + compaction)
+    bool     fastkv_enable      = false;
+    float    fastkv_retain_rate = 0.5f; // proportional retain (q_len*rate)
+    uint32_t fastkv_window_size = 8;
+    uint32_t fastkv_kernel_size = 7;
+    int      fastkv_pooling     = 0; // 0 = avgpool, 1 = maxpool
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

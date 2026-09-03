@@ -2450,6 +2450,47 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--fastkv"},
+        "Enable FastKV KV-cache compression (KV top-k token selection + compaction after prefill)",
+        [](common_params & params) {
+            params.fastkv_enable = true;
+        }
+    ).set_env("LLAMA_ARG_FASTKV"));
+    add_opt(common_arg(
+        {"--fastkv-ratio"}, "R",
+        string_format("FastKV proportional retain rate in percent (q_len*R/100 budget, mirrors FastKV retain_rate; default: %.0f%%)", params.fastkv_retain_rate * 100.0f),
+        [](common_params & params, int value) {
+            if (value > 0) {
+                params.fastkv_retain_rate = value / 100.0f;
+            }
+        }
+    ).set_env("LLAMA_ARG_FASTKV_RATIO"));
+    add_opt(common_arg(
+        {"--fastkv-window"}, "N",
+        string_format("FastKV trailing window size (always kept, default: %u)", params.fastkv_window_size),
+        [](common_params & params, int value) {
+            if (value > 0) {
+                params.fastkv_window_size = (uint32_t) value;
+            }
+        }
+    ).set_env("LLAMA_ARG_FASTKV_WINDOW"));
+    add_opt(common_arg(
+        {"--fastkv-kernel"}, "N",
+        string_format("FastKV pooling kernel size (default: %u)", params.fastkv_kernel_size),
+        [](common_params & params, int value) {
+            if (value > 0) {
+                params.fastkv_kernel_size = (uint32_t) value;
+            }
+        }
+    ).set_env("LLAMA_ARG_FASTKV_KERNEL"));
+    add_opt(common_arg(
+        {"--fastkv-pooling"}, "avg|max",
+        string_format("FastKV pooling method (default: %s)", params.fastkv_pooling == 1 ? "max" : "avg"),
+        [](common_params & params, const std::string & value) {
+            params.fastkv_pooling = (value == "max") ? 1 : 0;
+        }
+    ).set_env("LLAMA_ARG_FASTKV_POOLING"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {
