@@ -1872,9 +1872,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 LLAMA_LOG_INFO("%s: FastKV trigger on %u seqs (n_tokens=%u, last prefill ubatch)\n",
                                __func__, ubatch.n_seqs_unq, ubatch.n_tokens);
 
-                // [stage-1b verify] readback the per-layer saliency captured in the
-                // last prefill ubatch and log it, to validate the real-attention
-                // capture pipeline before wiring it into compaction.
+                // [stage-2] read back the per-layer saliency captured in the last
+                // prefill ubatch, average it across attention layers into one
+                // per-position score vector, and compact the KV cache from it
+                // (REAL attention scores instead of the CPU approximated scorer).
+                std::vector<float> sal_all;
+                size_t sal_layers = 0;
                 if (res) {
                     const uint32_t n_layer_fk = model.hparams.n_layer();
                     for (uint32_t il = 0; il < n_layer_fk; ++il) {
@@ -1883,9 +1886,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             continue; // not an attention layer / not captured
                         }
                         // kq: [n_kv, n_tokens, n_head, n_stream]
-                        // host-side per-key saliency = sum of softmax attention
-                        // weights over query positions (n_tokens) and heads,
-                        // for each KV token. C-order: [i + j*n_kv + h*n_kv*T + s*n_kv*T*H]
                         const size_t n_kv  = (size_t) kq->ne[0];
                         const size_t n_tok = (size_t) kq->ne[1];
                         const size_t n_hd  = (size_t) kq->ne[2];
@@ -1897,8 +1897,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         std::vector<float> kbuf(total);
                         ggml_backend_tensor_get(kq, kbuf.data(), 0, total * sizeof(float));
                         std::vector<float> sal(n_kv, 0.0f);
-                        double ssum = 0.0; float mx = -1.0f, mn = 1e9f;
-                        size_t sal_nz = 0;
                         for (size_t h = 0; h < n_hd; ++h) {
                             for (size_t j = 0; j < n_tok; ++j) {
                                 const size_t base = h * n_kv * n_tok + j * n_kv;
@@ -1907,22 +1905,29 @@ int llama_context::decode(const llama_batch & batch_inp) {
                                 }
                             }
                         }
-                        for (size_t i = 0; i < n_kv; ++i) {
-                            mx = std::max(mx, sal[i]);
-                            mn = std::min(mn, sal[i]);
-                            ssum += sal[i];
-                            if (sal[i] > 1e-6f) sal_nz++;
+                        // accumulate across layers (by position)
+                        if (sal_all.size() < n_kv) {
+                            sal_all.resize(n_kv, 0.0f);
                         }
-                        LLAMA_LOG_INFO("%s:   fk_hostsal[%u] n_kv=%zu n_tok=%zu n_hd=%zu max=%.4f mean=%.4f min=%.4f nz=%zu first8=[%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f]\n",
-                                       __func__, il, n_kv, n_tok, n_hd,
-                                       mx, n_kv ? (float) (ssum / (double) n_kv) : 0.0f, mn, sal_nz,
-                                       n_kv>0?sal[0]:0, n_kv>1?sal[1]:0, n_kv>2?sal[2]:0, n_kv>3?sal[3]:0,
-                                       n_kv>4?sal[4]:0, n_kv>5?sal[5]:0, n_kv>6?sal[6]:0, n_kv>7?sal[7]:0);
+                        for (size_t i = 0; i < n_kv; ++i) {
+                            sal_all[i] += sal[i];
+                        }
+                        sal_layers++;
+                    }
+                    // average across layers
+                    if (sal_layers > 0) {
+                        for (auto & v : sal_all) {
+                            v /= (float) sal_layers;
+                        }
                     }
                 }
 
                 for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
-                    kv->fastkv_compact(ubatch.seq_id_unq[s]);
+                    if (sal_layers > 0 && !sal_all.empty()) {
+                        kv->fastkv_compact_from_saliency(ubatch.seq_id_unq[s], sal_all);
+                    } else {
+                        kv->fastkv_compact(ubatch.seq_id_unq[s]);
+                    }
                 }
             }
         }

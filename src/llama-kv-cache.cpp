@@ -663,7 +663,85 @@ std::vector<uint32_t> llama_kv_cache::fastkv_score(llama_seq_id seq_id) const {
     return kept;
 }
 
-bool llama_kv_cache::fastkv_compact(llama_seq_id seq_id) {
+bool llama_kv_cache::fastkv_compact_from_saliency(llama_seq_id seq_id, const std::vector<float> & saliency) {
+    if (!fastkv.enable || seq_id < 0) {
+        return false;
+    }
+
+    const uint32_t strm = seq_to_stream[seq_id];
+    const auto & cells = v_cells[strm];
+
+    // collect this sequence's cells, in position order
+    std::vector<uint32_t> seq_cells;
+    std::vector<llama_pos> seq_pos;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.pos_in(i, 0, std::numeric_limits<llama_pos>::max()) && cells.seq_has(i, seq_id)) {
+            seq_cells.push_back(i);
+            seq_pos.push_back(cells.pos_get(i));
+        }
+    }
+    const uint32_t n_cand = (uint32_t) seq_cells.size();
+    if (n_cand == 0) {
+        return false;
+    }
+
+    // proportional budget (same as fastkv_score)
+    llama_pos max_pos = -1;
+    for (uint32_t c = 0; c < n_cand; ++c) {
+        if (seq_pos[c] > max_pos) max_pos = seq_pos[c];
+    }
+    const uint32_t q_len = (uint32_t) std::max(0, (int) max_pos + 1);
+    uint32_t budget = (uint32_t) std::max(1.0f, std::round(q_len * fastkv.retain_rate));
+    budget = std::max(budget, fastkv.window_size + 1u);
+
+    if (n_cand <= budget) {
+        return false;
+    }
+    const uint32_t n_keep = budget - fastkv.window_size;
+
+    // score each candidate cell by the captured real saliency at its position
+    std::vector<float> score(n_cand, 0.0f);
+    for (uint32_t c = 0; c < n_cand; ++c) {
+        const llama_pos p = seq_pos[c];
+        if (p >= 0 && (size_t) p < saliency.size()) {
+            score[c] = saliency[(size_t) p];
+        }
+    }
+
+    // keep top-(budget-window) from the non-window prefix + trailing window
+    const uint32_t n_prefix = n_cand - fastkv.window_size;
+    std::vector<uint32_t> prefix_idx(n_prefix);
+    for (uint32_t i = 0; i < n_prefix; ++i) {
+        prefix_idx[i] = i;
+    }
+    std::partial_sort(prefix_idx.begin(),
+                      prefix_idx.begin() + (size_t) std::min(n_keep, n_prefix),
+                      prefix_idx.end(),
+                      [&](uint32_t a, uint32_t b) { return score[a] > score[b]; });
+
+    std::set<uint32_t> kept_set;
+    for (uint32_t i = 0; i < std::min(n_keep, n_prefix); ++i) {
+        kept_set.insert(prefix_idx[i]);
+    }
+    for (uint32_t i = n_prefix; i < n_cand; ++i) {
+        kept_set.insert(i);
+    }
+    std::vector<uint32_t> kept;
+    kept.reserve(kept_set.size());
+    for (uint32_t idx : kept_set) {
+        kept.push_back(seq_cells[idx]);
+    }
+    std::sort(kept.begin(), kept.end(), [&](uint32_t a, uint32_t b) {
+        return cells.pos_get(a) < cells.pos_get(b);
+    });
+
+    if (kept.size() >= n_cand) {
+        return false;
+    }
+    return fastkv_compact(seq_id, &kept);
+}
+
+bool llama_kv_cache::fastkv_compact(llama_seq_id seq_id, const std::vector<uint32_t> * keep_override) {
     if (!fastkv.enable || seq_id < 0) {
         return false;
     }
@@ -672,7 +750,14 @@ bool llama_kv_cache::fastkv_compact(llama_seq_id seq_id) {
     auto & cells = v_cells[strm];
 
     // compute surviving cell indices (empty => nothing to do / too short)
-    std::vector<uint32_t> kept = fastkv_score(seq_id);
+    // when keep_override is provided (real saliency from prefill capture) it
+    // replaces the internal approximated scorer entirely.
+    std::vector<uint32_t> kept;
+    if (keep_override != nullptr) {
+        kept = *keep_override;
+    } else {
+        kept = fastkv_score(seq_id);
+    }
     if (kept.size() == 0) {
         return false;
     }

@@ -226,7 +226,18 @@ public:
 
     // compress the KV cache of the given sequence using the FastKV scorer
     // returns true if compaction happened, false otherwise (e.g. disabled / too short)
-    bool fastkv_compact(llama_seq_id seq_id);
+    // if keep_override is non-null, it is used as the surviving cell list
+    // (physical cell indices, position order) instead of the internal
+    // approximated scorer -- used to feed the REAL per-key saliency captured
+    // during prefill directly into compaction.
+    bool fastkv_compact(llama_seq_id seq_id, const std::vector<uint32_t> * keep_override = nullptr);
+
+    // compress using a per-key saliency vector (REAL softmax attention, captured
+    // during prefill and reduced on the host). saliency[i] is the saliency of the
+    // i-th KV position of this sequence. The top-(budget-window) saliency keys
+    // plus the trailing window are retained (FastKV policy), replacing the
+    // internal approximated scorer. Returns true if compaction happened.
+    bool fastkv_compact_from_saliency(llama_seq_id seq_id, const std::vector<float> & saliency);
 
     // compute the surviving cell indices for the sequence under the FastKV
     // scoring policy (top-(budget-window) + trailing window). returns {} when
