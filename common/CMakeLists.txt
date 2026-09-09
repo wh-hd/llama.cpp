@@ -92,6 +92,10 @@ add_library(${TARGET}
     ngram-map.h
     ngram-mod.cpp
     ngram-mod.h
+    rest-store.cpp
+    rest-store.h
+    libsais.c
+    libsais.h
     peg-parser.cpp
     peg-parser.h
     preset.cpp

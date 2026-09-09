@@ -180,6 +180,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_REST,          // retrieval-based speculative decoding (RETS-style)
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -367,6 +368,16 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+// REST (Retrieval-Based Speculative Decoding) parameters
+// ref: https://github.com/FasterDecoding/REST
+struct common_params_speculative_rest {
+    std::string datastore_path;      // path of the offline token-corpus datastore
+    uint16_t    size_key      = 8;   // length of the lookup suffix (retrieval key)
+    uint16_t    size_draft    = 16;  // max number of draft tokens to retrieve
+    uint16_t    topk          = 4;   // number of candidate continuations per key
+    float       prune_alpha   = 0.0f; // low-frequency branch pruning threshold
+};
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
@@ -380,6 +391,8 @@ struct common_params_speculative {
     common_params_speculative_ngram_map ngram_simple;
     common_params_speculative_ngram_map ngram_map_k;
     common_params_speculative_ngram_map ngram_map_k4v;
+
+    common_params_speculative_rest rest;
 
     common_params_speculative_ngram_cache ngram_cache;
 

@@ -69,6 +69,26 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // M3 (REST tree): optional structured tree draft. When an implementation
+    // fills this (instead of `result`), the entry point must build a multi-seq
+    // tree batch and accept the longest consistent path.
+    struct tree_draft {
+        // node 0 is the sampled token (root); children reference parents by index.
+        // tokens[i]    : token id at node i
+        // parent[i]    : index of parent node (-1 for root / sampled)
+        // retrieve_idx[i] : batch position of node i's logits (set at build time)
+        struct node {
+            llama_token id;
+            int32_t     parent; // -1 = root
+        };
+        std::vector<node> nodes;
+
+        // conditioning key length actually used (span) - informational
+        int32_t span = 0;
+
+        bool empty() const { return nodes.empty(); }
+    } tree = {};
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

@@ -8,6 +8,7 @@
 #include "ngram-cache.h"
 #include "ngram-map.h"
 #include "ngram-mod.h"
+#include "rest-store.h"
 #include "sampling.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
@@ -41,7 +42,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"rest",          COMMON_SPECULATIVE_TYPE_REST}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -2174,6 +2176,144 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     }
 };
 
+// state of REST (Retrieval-Based Speculative Decoding)
+struct common_speculative_impl_rest : public common_speculative_impl {
+    common_params_speculative_rest params;
+
+    // offline token-corpus datastore (shared across sequences)
+    common_rest_store store;
+
+    common_speculative_impl_rest(
+            const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_REST, n_seq, params.rest.size_draft)
+    {
+        this->params = params.rest;
+        store.size_key   = this->params.size_key;
+        store.size_draft = this->params.size_draft;
+        store.topk       = this->params.topk;
+
+        if (this->params.datastore_path.empty()) {
+            SPC_ERR("%s", "REST requires a datastore path (--spec-rest-datastore)\n");
+            throw std::runtime_error("REST: no datastore path set");
+        }
+
+        if (!store.load(this->params.datastore_path)) {
+            SPC_ERR("failed to load datastore '%s'\n", this->params.datastore_path.c_str());
+            throw std::runtime_error("REST: failed to load datastore");
+        }
+
+        SPC_TRC("%s", "adding speculative implementation 'rest'\n");
+        SPC_TRC("- datastore=%s, size_key=%d, size_draft=%d, topk=%d\n",
+                this->params.datastore_path.c_str(),
+                this->params.size_key, this->params.size_draft, this->params.topk);
+    }
+
+    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
+        // noop
+    }
+
+    bool process(const llama_batch & /*batch*/) override {
+        // TODO: implement
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        assert(dparams.size() == n_seq);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            // Build the retrieval key. Following the official REST, we try key
+            // lengths from `size_key` (longest) down to 2 and stop at the first
+            // hit. A longer key is more specific; falling back lets us still
+            // fire a draft when the exact long suffix is absent from the store.
+            const auto & prompt = *dp.prompt;
+            llama_tokens key;
+            bool hit = false;
+            for (size_t span = params.size_key; span >= 2 && !hit; --span) {
+                if (prompt.size() < span) {
+                    continue;
+                }
+                key.clear();
+                key.reserve(span);
+                for (size_t i = prompt.size() - span; i < prompt.size(); ++i) {
+                    key.push_back(prompt[i]);
+                }
+                const auto continuations = store.retrieve_all(key);
+                if (!continuations.empty()) {
+                    // M3: build a candidate Trie from ALL continuations and emit it
+                    // as a structured tree draft (nodes with parent links).
+                    //
+                    // Reference approach (utils.py / lib.rs):
+                    //   count the prefix occurrence of every candidate segment,
+                    //   keep the highest-frequency prefix paths as the Trie, then
+                    //   emit the tree nodes root -> children.
+                    //
+                    // We build a trie of all token sequences and assign each node a
+                    // monotonically growing index; node.parent points to its trie
+                    // parent (-1 for the root). Children of the root are the
+                    // distinct first tokens of the continuations; deeper nodes
+                    // follow shared prefixes. We cap the total node count at
+                    // size_draft (the verify budget).
+                    dp.tree.nodes.clear();
+                    dp.tree.span = (int32_t) key.size();
+
+                    // node 0 = root (placeholder; not a real draft token)
+                    auto & nodes = dp.tree.nodes;
+                    nodes.push_back({ /*id*/ (llama_token) -1, /*parent*/ -1 });
+
+                    // map from trie-prefix (token sequence) -> node index
+                    // A simple representation: we insert continuations char-by-char,
+                    // reusing existing prefixes as parents.
+                    // nodes are stored in insertion order; to find an existing child
+                    // we scan the parent's children linearly (small trie, fast).
+                    for (const auto & cont : continuations) {
+                        int32_t parent = 0; // root index
+                        if ((int32_t) nodes.size() >= params.size_draft + 1) {
+                            break; // reached draft budget
+                        }
+                        for (llama_token id : cont) {
+                            // look for an existing child of `parent` with token `id`
+                            int32_t child = -1;
+                            for (size_t i = 1; i < nodes.size(); ++i) {
+                                if (nodes[i].parent == parent && nodes[i].id == id) {
+                                    child = (int32_t) i;
+                                    break;
+                                }
+                            }
+                            if (child == -1) {
+                                if ((int32_t) nodes.size() >= params.size_draft + 1) {
+                                    break; // reached draft budget
+                                }
+                                child = (int32_t) nodes.size();
+                                nodes.push_back({ id, parent });
+                            }
+                            parent = child;
+                        }
+                    }
+
+                    // remove the placeholder root if no children were added
+                    if (nodes.size() == 1) {
+                        nodes.clear();
+                    } else {
+                        SPC_TRC("rest: tree draft for seq %d: %zu nodes (span=%zu)\n",
+                                (int) seq_id, nodes.size(), key.size());
+                    }
+                    hit = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+        // noop
+    }
+};
+
 struct common_speculative {
     common_speculative_draft_params_vec dparams;
 
@@ -2250,6 +2390,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_REST:           return "rest";
         default:                                    return "unknown";
     }
 }
@@ -2352,6 +2493,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
                 n_max = std::max(n_max, (int32_t) 8);
+                break;
+            case COMMON_SPECULATIVE_TYPE_REST:
+                n_max = std::max(n_max, (int32_t) spec->rest.size_draft);
                 break;
             case COMMON_SPECULATIVE_TYPE_NONE:
             case COMMON_SPECULATIVE_TYPE_COUNT:
@@ -2612,7 +2756,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -2621,6 +2765,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_REST);
 
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
@@ -2697,6 +2842,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                         params.ngram_cache.lookup_cache_static,
                         params.ngram_cache.lookup_cache_dynamic);
                 impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(state));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_REST: {
+                impls.push_back(std::make_unique<common_speculative_impl_rest>(config.params, n_seq));
                 break;
             }
             default:
@@ -2827,6 +2976,35 @@ void common_speculative_draft(common_speculative * spec) {
             }
 
             auto & result = *dp.result;
+
+            // M3 (REST tree): if the impl produced a structured tree draft but
+            // left the flat `result` empty, materialize the leftmost-longest
+            // path into `result` so the existing linear verification still
+            // sees a draft (the tree itself is consumed by tree-aware callers).
+            if (result.empty() && !dp.tree.empty()) {
+                // walk from each node up to root to find the longest path
+                const auto & nodes = dp.tree.nodes;
+                // choose the deepest node as the tip of the longest path
+                int32_t deepest = 1;
+                for (int32_t i = 1; i < (int32_t) nodes.size(); ++i) {
+                    // measure depth
+                    int32_t d = 0, p = i;
+                    while (p > 0) { ++d; p = nodes[p].parent; }
+                    int32_t d0 = 0, q = deepest;
+                    while (q > 0) { ++d0; q = nodes[q].parent; }
+                    if (d > d0) {
+                        deepest = i;
+                    }
+                }
+                std::vector<llama_token> path;
+                int32_t p = deepest;
+                while (p > 0) {
+                    path.push_back(nodes[p].id);
+                    p = nodes[p].parent;
+                }
+                std::reverse(path.begin(), path.end());
+                result = std::move(path);
+            }
 
             // a new draft has been sampled
             if (dp.drafting && !result.empty()) {

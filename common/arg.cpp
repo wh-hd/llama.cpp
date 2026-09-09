@@ -4389,6 +4389,44 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
+    add_opt(common_arg(
+        {"--spec-rest-datastore"}, "FNAME",
+        "path to REST datastore (flat file of u32 token ids) for retrieval-based speculative decoding",
+        [](common_params & params, const std::string & value) {
+            params.speculative.rest.datastore_path = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_REST_DATASTORE"));
+    add_opt(common_arg(
+        {"--spec-rest-size-key"}, "N",
+        string_format("maximum length of the retrieval key (context suffix) for REST speculative decoding; shorter keys down to 2 are tried until one hits (default: %d)", params.speculative.rest.size_key),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("rest key size must be between 1 and 1024 inclusive");
+            }
+            params.speculative.rest.size_key = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-rest-size-draft"}, "N",
+        string_format("maximum number of draft tokens for REST speculative decoding (default: %d)", params.speculative.rest.size_draft),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("rest draft size must be between 1 and 1024 inclusive");
+            }
+            params.speculative.rest.size_draft = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-rest-topk"}, "N",
+        string_format("number of candidate continuations per key for REST speculative decoding (default: %d)", params.speculative.rest.topk),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 64) {
+                throw std::invalid_argument("rest topk must be between 1 and 64 inclusive");
+            }
+            params.speculative.rest.topk = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
     //
     // removed params
     //
