@@ -663,7 +663,7 @@ std::vector<uint32_t> llama_kv_cache::fastkv_score(llama_seq_id seq_id) const {
     return kept;
 }
 
-bool llama_kv_cache::fastkv_compact_from_saliency(llama_seq_id seq_id, const std::vector<float> & saliency) {
+bool llama_kv_cache::fastkv_compact_from_saliency(llama_seq_id seq_id, const std::vector<float> & saliency, llama_context * lctx) {
     if (!fastkv.enable || seq_id < 0) {
         return false;
     }
@@ -738,10 +738,10 @@ bool llama_kv_cache::fastkv_compact_from_saliency(llama_seq_id seq_id, const std
     if (kept.size() >= n_cand) {
         return false;
     }
-    return fastkv_compact(seq_id, &kept);
+    return fastkv_compact(seq_id, &kept, lctx);
 }
 
-bool llama_kv_cache::fastkv_compact(llama_seq_id seq_id, const std::vector<uint32_t> * keep_override) {
+bool llama_kv_cache::fastkv_compact(llama_seq_id seq_id, const std::vector<uint32_t> * keep_override, llama_context * lctx) {
     if (!fastkv.enable || seq_id < 0) {
         return false;
     }
@@ -778,8 +778,40 @@ bool llama_kv_cache::fastkv_compact(llama_seq_id seq_id, const std::vector<uint3
     // snapshot surviving cell metadata (pos/ext/seq) in target order
     llama_kv_cells snapshot = cells.cp(kept);
 
-    // physical K/V reorder (host round-trip, device-agnostic)
-    // for each layer, compact the surviving columns to the front positions 0..kept-1
+    // Physical K/V reorder. Prefer a device-side gather graph (no host round
+    // trip, much faster than the host memcpy path on Metal/multi-device). Fall
+    // back to the host memcpy path if the device graph cannot be built/run.
+    // For generality: only use the device-side graph when the K/V lives on a
+    // real accelerator backend (not a plain host/CPU buffer) -- on a CPU-only
+    // / -ngl 0 setup get_rows/f32 intermediates cost more than plain memcpy,
+    // so the host path is the right choice there.
+    {
+        bool kv_on_device = false;
+        for (const auto & layer : layers) {
+            if (layer.k && layer.k->buffer) {
+                kv_on_device = !ggml_backend_buffer_is_host(layer.k->buffer);
+                break;
+            }
+        }
+        if (lctx != nullptr && !other && kv_on_device) {
+            auto * sched = lctx->get_sched();
+            if (sched) {
+                ggml_backend_sched_reset(sched);
+                auto * res = lctx->get_gf_res_reserve();
+                res->reset();
+                auto * gf = build_graph_compact(res, strm, kept);
+                if (ggml_backend_sched_alloc_graph(sched, gf)) {
+                    res->set_inputs(nullptr);
+                    if (lctx->graph_compute(gf, false) == GGML_STATUS_SUCCESS) {
+                        goto do_meta;
+                    }
+                }
+            }
+        }
+    }
+
+    // host round-trip fallback: for each layer, compact the surviving columns
+    // to the front positions 0..kept-1
     for (auto & layer : layers) {
         const uint32_t il = layer.il;
 
@@ -845,6 +877,7 @@ bool llama_kv_cache::fastkv_compact(llama_seq_id seq_id, const std::vector<uint3
         }
     }
 
+do_meta:
     // relocate cell metadata: free all seq cells, then write survivors to front
     std::vector<uint32_t> all_seq = seq_cells;
     // remove this sequence from every cell (freeing empty ones)
@@ -1935,6 +1968,41 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     }
 }
 
+void llama_kv_cache::set_compact_input_k(ggml_tensor * dst, const std::vector<uint32_t> & kept) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    int32_t * data = (int32_t *) dst->data;
+    for (size_t j = 0; j < kept.size(); ++j) {
+        data[j] = (int32_t) kept[j];
+    }
+}
+
+void llama_kv_cache::set_compact_input_v(ggml_tensor * dst, uint32_t strm, const std::vector<uint32_t> & kept) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    const int64_t kv_size      = get_size();
+    const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa_max();
+    const int64_t offs         = strm*kv_size*n_embd_v_gqa;
+
+    if (!v_trans) {
+        // V stored non-transposed: gather whole columns by cell index (like K)
+        GGML_ASSERT((int64_t) dst->ne[0] == (int64_t) kept.size());
+        int32_t * data = (int32_t *) dst->data;
+        for (size_t j = 0; j < kept.size(); ++j) {
+            data[j] = (int32_t) kept[j];
+        }
+        return;
+    }
+
+    // note: the V cache is transposed when not using flash attention
+    GGML_ASSERT((int64_t) dst->ne[0] == (int64_t) kept.size()*n_embd_v_gqa);
+    int32_t * data = (int32_t *) dst->data;
+    for (size_t j = 0; j < kept.size(); ++j) {
+        for (int64_t e = 0; e < n_embd_v_gqa; ++e) {
+            data[j*n_embd_v_gqa + e] = (int32_t) (offs + e*kv_size + (int64_t) kept[j]);
+        }
+    }
+}
+
+
 void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
@@ -2340,6 +2408,110 @@ void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
     if (k_rot) {
         kv_self->set_input_k_rot(k_rot);
     }
+}
+
+// device-side FastKV compaction input: per-layer K/V column gather indices
+class llm_graph_input_compact : public llm_graph_input_i {
+public:
+    llm_graph_input_compact(const llama_kv_cache * kv_self, uint32_t strm, std::vector<uint32_t> kept)
+        : kv_self(kv_self), strm(strm), kept(std::move(kept)) {}
+    virtual ~llm_graph_input_compact() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        for (auto & [il, t] : k_idxs) {
+            kv_self->set_compact_input_k(t, kept);
+        }
+        for (auto & [il, t] : v_idxs) {
+            kv_self->set_compact_input_v(t, strm, kept);
+        }
+    }
+
+    std::vector<std::pair<int32_t, ggml_tensor *>> k_idxs;
+    std::vector<std::pair<int32_t, ggml_tensor *>> v_idxs;
+    const llama_kv_cache * kv_self;
+
+    uint32_t strm;
+    std::vector<uint32_t> kept;
+};
+
+ggml_cgraph * llama_kv_cache::build_graph_compact(llm_graph_result * res, uint32_t strm, const std::vector<uint32_t> & kept) const {
+    auto * ctx = res->get_ctx();
+    auto * gf  = res->get_gf();
+
+    const uint32_t n_keep = (uint32_t) kept.size();
+    if (n_keep == 0) {
+        return gf;
+    }
+
+    auto inp = std::make_unique<llm_graph_input_compact>(this, strm, kept);
+
+    for (const auto & layer : layers) {
+        const int32_t il = layer.il;
+
+        // ---- K (and non-transposed V): gather whole columns by cell index ----
+        if (layer.k) {
+            auto * k_stream = layer.k_stream[strm];
+            if (k_stream) {
+                const int64_t n_embd_k_gqa = k_stream->ne[0];
+                ggml_tensor * k_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_keep);
+                ggml_set_input(k_idx);
+                inp->k_idxs.emplace_back(il, k_idx);
+
+                ggml_tensor * k_gathered = ggml_get_rows(ctx, k_stream, k_idx); // [embd_k, n_keep] F32
+                ggml_tensor * k_front = ggml_view_2d(ctx, k_stream, n_embd_k_gqa, n_keep, k_stream->nb[1], 0);
+                ggml_cpy(ctx, k_gathered, k_front);
+                // explicitly expand both the gather and the copy so the gather
+                // node and the k_idx input leaf are unconditionally part of the
+                // graph (and thus get host buffers allocated by the sched/gallocr)
+                ggml_build_forward_expand(gf, k_gathered);
+                ggml_build_forward_expand(gf, k_front);
+            }
+        }
+
+        // ---- V ----
+        if (layer.v) {
+            auto * v_stream = layer.v_stream[strm];
+            if (!v_stream) {
+                continue;
+            }
+
+            if (!v_trans) {
+                // same layout as K: [embd_v, kv], gather columns
+                const int64_t n_embd_v_gqa = v_stream->ne[0];
+                ggml_tensor * v_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_keep);
+                ggml_set_input(v_idx);
+                inp->v_idxs.emplace_back(il, v_idx);
+
+                ggml_tensor * v_gathered = ggml_get_rows(ctx, v_stream, v_idx);
+                ggml_tensor * v_front = ggml_view_2d(ctx, v_stream, n_embd_v_gqa, n_keep, v_stream->nb[1], 0);
+                ggml_cpy(ctx, v_gathered, v_front);
+                ggml_build_forward_expand(gf, v_gathered);
+                ggml_build_forward_expand(gf, v_front);
+            } else {
+                // transposed V: element (cell c, embd e) sits at e*kv_size + c
+                // flatten the whole stream to one row and gather by flat index
+                const int64_t kv_size      = get_size();
+                const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa_max();
+                const int64_t n_flat       = n_embd_v_gqa*kv_size;
+
+                ggml_tensor * v_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) n_keep*n_embd_v_gqa);
+                ggml_set_input(v_idx);
+                inp->v_idxs.emplace_back(il, v_idx);
+
+                ggml_tensor * v_flat   = ggml_view_1d(ctx, v_stream, n_flat, 0);
+                ggml_tensor * v_gather = ggml_get_rows(ctx, v_flat, v_idx); // [1, n_keep*n_embd] F32
+                ggml_tensor * v_front  = ggml_view_1d(ctx, v_stream, (int64_t) n_keep*n_embd_v_gqa, 0);
+                ggml_cpy(ctx, v_gather, v_front);
+                ggml_build_forward_expand(gf, v_gather);
+                ggml_build_forward_expand(gf, v_front);
+            }
+        }
+    }
+
+    res->add_input(std::move(inp));
+
+    return gf;
 }
 
 ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_context * lctx) const {
