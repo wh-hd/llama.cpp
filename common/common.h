@@ -498,6 +498,12 @@ struct common_params {
     enum llama_attention_type    attention_type    = LLAMA_ATTENTION_TYPE_UNSPECIFIED; // attention type for embeddings
     enum llama_flash_attn_type   flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_AUTO; // whether to use Flash Attention
 
+    // XAttention block-sparse attention (path B: score -> top_k -> gather -> dense FA)
+    bool     xattn        = false; // enable XAttention block selection
+    int32_t  xattn_stride = 8;
+    int32_t  xattn_block  = 128;
+    int32_t  xattn_n_blocks = 4;
+
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;
     struct common_params_diffusion   diffusion;

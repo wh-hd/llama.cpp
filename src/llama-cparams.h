@@ -54,6 +54,12 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    // XAttention block-sparse attention (path B: score -> top_k -> gather -> dense FA)
+    bool   xattn        = false;   // enable XAttention scoring selection
+    int32_t xattn_stride = 8;      // antidiagonal importance sampling interval (S)
+    int32_t xattn_block  = 128;    // token-block granularity
+    int32_t xattn_n_blocks = 4;    // fixed #kv blocks to keep per query block (top_k budget)
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

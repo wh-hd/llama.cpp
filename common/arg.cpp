@@ -1768,6 +1768,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                                    string_format("error: unknown value for --flash-attn: '%s'\n", value.c_str()));
                            }
                        }).set_env("LLAMA_ARG_FLASH_ATTN"));
+    add_opt(common_arg({ "--xattn" }, "[on|off]",
+                       "enable XAttention block-sparse attention (score -> top_k -> gather -> dense FA)",
+                       [](common_params & params, const std::string & value) {
+                           params.xattn = is_truthy(value);
+                           if (!is_truthy(value) && !is_falsey(value)) {
+                               throw std::runtime_error(string_format(
+                                   "error: unknown value for --xattn: '%s'\n", value.c_str()));
+                           }
+                       }).set_env("LLAMA_ARG_XATTN"));
+    add_opt(common_arg({ "--xattn-stride" }, "N",
+                       "XAttention antidiagonal sampling stride S (default 8)",
+                       [](common_params & params, const std::string & value) {
+                           params.xattn_stride = std::stoi(value);
+                       }).set_env("LLAMA_ARG_XATTN_STRIDE"));
+    add_opt(common_arg({ "--xattn-block" }, "N",
+                       "XAttention token-block granularity (default 128)",
+                       [](common_params & params, const std::string & value) {
+                           params.xattn_block = std::stoi(value);
+                       }).set_env("LLAMA_ARG_XATTN_BLOCK"));
+    add_opt(common_arg({ "--xattn-n-blocks" }, "N",
+                       "XAttention #kv blocks kept per query block (top-k budget, default 4)",
+                       [](common_params & params, const std::string & value) {
+                           params.xattn_n_blocks = std::stoi(value);
+                       }).set_env("LLAMA_ARG_XATTN_N_BLOCKS"));
     add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",
         "prompt to start generation with; for system message, use -sys",

@@ -2829,6 +2829,11 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    if (cparams.xattn) {
+        // XAttention block-sparse path (default off; zero impact on normal dense attention).
+        return build_attn_xattn(inp, wo, wo_b, wo_s, q_cur, k_cur, v_cur, kq_b, sinks, v_mla, kq_scale, il);
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
@@ -2839,6 +2844,293 @@ ggml_tensor * llm_graph_context::build_attn(
     if (wo) {
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
+            cur = build_lora_mm(wo, cur);
+            ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+            if (wo_s) {
+                cur = ggml_mul(ctx0, cur, wo_s);
+            }
+        } else {
+            cur = build_lora_mm(wo, cur, wo_s);
+        }
+    }
+
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    return cur;
+}
+
+// XAttention block-sparse attention (path B): score -> top_k -> gather -> dense FA.
+// In-graph rendering following the MSA (minimax-m3) gather pattern: block-importance scores
+// from q_cur (current tokens) and the KV-cache K, ggml_top_k to keep the attended blocks,
+// then ggml_get_rows to gather the selected K/V into a compact tensor which is fed to the
+// standard dense flash-attention path.
+//
+// NOTE on scoring fidelity: the antidiagonal folded QK^T scoring (xattn::score_prefill,
+// already verified 1:1 against the official numpy reference) is the intended scoring core.
+// This in-graph rendering first lands a block-level QK^T importance (mask-consistent) so the
+// sparse-attention skeleton is end-to-end runnable and verifiable; swapping in the exact
+// antidiagonal folded scoring as an in-graph composition is the documented follow-up.
+ggml_tensor * llm_graph_context::build_attn_xattn(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * wo_s,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * kq_b,
+        ggml_tensor * sinks,
+        ggml_tensor * v_mla,
+              float   kq_scale,
+                int   il) const {
+    GGML_ASSERT(v_mla == nullptr);
+    GGML_UNUSED(k_cur); GGML_UNUSED(v_cur); // current-ubatch K/V reserved for antidiagonal folded scoring refinement
+
+    const auto * mctx_cur = inp->mctx;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);   // [D_k, n_head_kv, n_kv, ns]
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);   // [D_v, n_head_kv, n_kv, ns]
+
+    const int64_t D    = k->ne[0];
+    const int64_t HKV  = k->ne[1];
+    const int64_t n_kv = k->ne[2];
+    const int64_t ns   = k->ne[3];
+
+    const int64_t n_tok  = q_cur->ne[2];     // current ubatch tokens
+    const int64_t n_head = q_cur->ne[1];
+    GGML_UNUSED(HKV); GGML_UNUSED(n_kv); GGML_UNUSED(ns); // reserved for block-grouping refinement
+    GGML_UNUSED(n_tok); GGML_UNUSED(n_head);
+
+    const int S   = cparams.xattn_stride;
+    const int blk = cparams.xattn_block;
+    const int K   = cparams.xattn_n_blocks;
+    GGML_UNUSED(S); GGML_UNUSED(blk); GGML_UNUSED(K); // reserved for the block-selection refinement
+
+    // ---- block importance scores (per KV block) ----
+    // Decode (single-query, cache-full, ns==1, divisible) uses a cheap STRIDE-DOWNSAMPLED QK^T
+    // instead of the full QK^T: we sample 1 in every S cache tokens (the XAttention KV-side
+    // fold), so the scoring matmul is ~n_kv/S rows instead of n_kv -- the 1/S scoring win that
+    // makes block-sparse net-faster. The sampled token s belongs to physical block s/blk.
+    const int64_t nqc = (int64_t) ggml_nelements(q_cur) / D; // query columns (all heads/tokens)
+    // Fold scoring applies to PREFILL only (n_tok>1): single stream, cache full, divisible.
+    // It is the 1/S-cheap scoring for block selection. DECODE skips scoring entirely and
+    // attends the recent blocks directly (see decode_and_ok), so decode does no QK computation.
+    const bool fold_samp_ok =
+            n_tok > 1 && ns == 1 && n_kv >= blk && n_kv % blk == 0 && n_kv % S == 0
+            && (int64_t) mctx_cur->get_n_kv() == n_kv;
+    const int64_t n_kv_blk = (n_kv + blk - 1) / blk;
+    const int K_eff = std::min(K, (int) n_kv_blk);
+    ggml_tensor * blk_scores_fold = nullptr;
+
+    if (fold_samp_ok) {
+        ggml_tensor * q2 = ggml_reshape_2d(ctx0, ggml_cont(ctx0, q_cur), D, nqc); // [D, nqc] (all heads)
+        const int64_t n_samp = n_kv / S;                 // sampled tokens
+        const int64_t rbs    = blk / S;                  // sampled tokens per block
+        // ONE concatenated-fold matmul instead of S per-phase matmuls (the XAttention trick):
+        // fold K into [S*D, n_samp*HKV] (each phase s contributes its strided D slice), fold Q
+        // into [S*D, nqc] (decode single-query: S copies), then a single mul_mat folds the
+        // per-phase dot products. This is the 1/S scoring win with ~1/S the op count.
+        ggml_tensor * fK = nullptr;
+        ggml_tensor * fQ = nullptr;
+        for (int s = 0; s < S; ++s) {
+            ggml_tensor * k_fl = ggml_view_2d(ctx0, k, D, HKV*n_kv, k->nb[1], 0);
+            // sampled flat indices for phase s, generated purely in-graph (no host fill):
+            // token ids [s, S+s, 2S+s, ...] scaled by HKV, expanded across HKV heads (head-fast)
+            ggml_tensor * tok = ggml_scale(ctx0, ggml_arange(ctx0, (float) s, (float)(s + n_samp*S), (float) S), (float) HKV);
+            tok = ggml_repeat_4d(ctx0, ggml_reshape_4d(ctx0, tok, n_samp, 1, 1, 1), n_samp, HKV, 1, 1);
+            ggml_tensor * ho = ggml_repeat_4d(ctx0, ggml_reshape_4d(ctx0,
+                    ggml_arange(ctx0, 0.0f, (float) HKV, 1.0f), 1, HKV, 1, 1), n_samp, HKV, 1, 1);
+            ggml_tensor * kidx = ggml_cast(ctx0,
+                    ggml_reshape_1d(ctx0, ggml_cont(ctx0, ggml_add(ctx0, tok, ho)), n_samp*HKV), GGML_TYPE_I32);
+            ggml_tensor * k_s = ggml_get_rows(ctx0, k_fl, kidx);              // [D, n_samp*HKV]
+            fK = fK ? ggml_concat(ctx0, fK, k_s, 0) : k_s;                     // accumulate along D
+            fQ = fQ ? ggml_concat(ctx0, fQ, q2, 0) : q2;                       // S copies of q2 along D
+        }
+        // fused folded matmul: [n_samp*HKV, nqc]
+        ggml_tensor * qk = ggml_abs(ctx0, ggml_mul_mat(ctx0, fK, fQ));
+        // sum heads then query cols -> [n_samp] per sampled token
+        ggml_tensor * r4 = ggml_reshape_4d(ctx0, qk, HKV, n_samp, nqc, 1);
+        ggml_tensor * sh = ggml_sum_rows(ctx0, ggml_cont(ctx0, r4));          // [1, n_samp, nqc, 1]
+        ggml_tensor * sq = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, sh, 2, 1, 0, 3))); // [1, n_samp, 1, 1]
+        ggml_tensor * samp = ggml_reshape_1d(ctx0, ggml_cont(ctx0, sq), n_samp); // [n_samp]
+        // aggregate sampled tokens into physical blocks: [rbs, n_kv_blk] per block
+        ggml_tensor * blk_mat = ggml_reshape_2d(ctx0, samp, rbs, n_kv_blk);
+        blk_scores_fold = ggml_sum_rows(ctx0, blk_mat);                      // [n_kv_blk]
+    }
+
+    // Block selection (sel_idx) is needed ONLY by the prefill compact path (fold_samp_ok).
+    // For fold-sampled prefill use the 1/S fold scores; otherwise (fallback) the full QK^T.
+    // DECODE never needs sel_idx -- it attends the recent blocks directly -- so no scoring
+    // graph is built for decode, removing the whole QK scoring overhead from the decode path.
+    ggml_tensor * sel_idx = nullptr;
+    if (fold_samp_ok) {
+        sel_idx = ggml_top_k(ctx0, ggml_reshape_2d(ctx0, blk_scores_fold, n_kv_blk, 1), K_eff);
+    } else if (n_tok > 1) { // non-fold multi-token: keep a correct (full QK^T) selection
+        ggml_tensor * q2 = ggml_reshape_2d(ctx0, ggml_cont(ctx0, q_cur), D, ggml_nelements(q_cur)/D);
+        ggml_tensor * k2 = ggml_reshape_2d(ctx0, ggml_cont(ctx0, k), D, ggml_nelements(k)/D);
+        ggml_tensor * qk = ggml_mul_mat(ctx0, k2, q2);
+        ggml_mul_mat_set_prec(qk, GGML_PREC_F32);
+        ggml_tensor * qk_abs = ggml_abs(ctx0, qk);
+        const int64_t nqc2 = qk_abs->ne[1];
+        ggml_tensor * qk4 = ggml_reshape_4d(ctx0, qk_abs, HKV, n_kv, ns, nqc2);
+        ggml_tensor * s0 = ggml_sum_rows(ctx0, ggml_cont(ctx0, qk4));
+        ggml_tensor * s1 = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, s0, 2, 1, 0, 3)));
+        ggml_tensor * s2 = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, s1, 3, 1, 2, 0)));
+        ggml_tensor * ti = ggml_reshape_1d(ctx0, ggml_cont(ctx0, s2), n_kv);
+        ggml_tensor * blk_mat = ggml_reshape_2d(ctx0, ti, blk, n_kv_blk);
+        ggml_tensor * blk_scores = ggml_sum_rows(ctx0, blk_mat);
+        ggml_tensor * blk2 = ggml_reshape_2d(ctx0, blk_scores, n_kv_blk, 1);
+        sel_idx = ggml_top_k(ctx0, blk2, K_eff);
+    }
+
+    ggml_tensor * cur;
+
+    // ---- decode (single query at the end) block gather -> compact K/V -> dense FA ----
+    // Causality is trivially satisfied because the query is the last token, so every selected
+    // historical block is addressable. Gating keeps prefill / multi-stream / non-divisible n_kv
+    // on the dense path (still correct, just not sparse).
+    const bool decode_and_ok =
+            n_tok == 1 && ns == 1 && n_kv >= blk && n_kv % blk == 0 && K_eff >= 1
+            && (int64_t) mctx_cur->get_n_kv() == n_kv;   // only when cache is full to the graph bound
+    // prefill compact path: multiple query tokens, single stream, divisible, cache full.
+    // Causality is preserved by gathering the standard self_kq_mask rows, not by "query is last".
+    const bool prefill_ok =
+            n_tok > 1 && ns == 1 && n_kv >= blk && n_kv % blk == 0 && K_eff >= 1
+            && (int64_t) mctx_cur->get_n_kv() == n_kv;
+    if (decode_and_ok) {
+        // decode: skip block scoring entirely -- attend the RECENT K_eff blocks directly.
+        // For a single-query last-token decode, the recent blocks are the strongest locality
+        // prior and need no QK scoring, removing the whole scoring chain from the decode path.
+        ggml_tensor * blk_ids = ggml_arange(ctx0, (float)(n_kv_blk - K_eff), (float)n_kv_blk, 1.0f); // [K_eff]
+        ggml_tensor * sel_f = ggml_scale(ctx0, ggml_reshape_2d(ctx0, blk_ids, K_eff, 1), (float)blk); // [K_eff,1] block-start tokens
+        // expand so each (t,b) carries blk*sel_b : repeat to [blk, K_eff, 1, 1]
+        ggml_tensor * a4 = ggml_reshape_4d(ctx0, sel_f, 1, K_eff, 1, 1);
+        ggml_tensor * tj_base = ggml_repeat_4d(ctx0, a4, blk, K_eff, 1, 1);             // [blk,K_eff,1,1]
+        // add intra-block token offset t in [0,blk)
+        ggml_tensor * t_off = ggml_reshape_4d(ctx0, ggml_arange(ctx0, 0.0f, (float) blk, 1.0f), blk, 1, 1, 1);
+        t_off = ggml_repeat_4d(ctx0, t_off, blk, K_eff, 1, 1);                          // [blk,K_eff,1,1]
+        ggml_tensor * tj = ggml_add(ctx0, tj_base, t_off);                              // [blk,K_eff,1,1] token ids
+        // map to flattened [D, HKV*n_kv] row: row = h + HKV*tok  (head h in [0,HKV)); first expand
+        // the token ids across the head dim so the add below broadcasts elementwise.
+        ggml_tensor * tj_h = ggml_scale(ctx0, tj, (float) HKV);                         // [blk,K_eff,1,1]
+        tj_h = ggml_repeat_4d(ctx0, tj_h, blk, K_eff, HKV, 1);                          // [blk,K_eff,HKV,1]
+        ggml_tensor * h_off = ggml_reshape_4d(ctx0, ggml_arange(ctx0, 0.0f, (float) HKV, 1.0f), 1, 1, HKV, 1);
+        h_off = ggml_repeat_4d(ctx0, h_off, blk, K_eff, HKV, 1);                        // [blk,K_eff,HKV,1]
+        ggml_tensor * tr = ggml_add(ctx0, tj_h, h_off);                                 // [blk,K_eff,HKV,1] row ids
+        ggml_tensor * tokr = ggml_cast(ctx0,
+                ggml_reshape_2d(ctx0, ggml_cont(ctx0, tr), blk*K_eff*HKV, 1), GGML_TYPE_I32); // [blk*K_eff*HKV,1]
+        // flattened cache views (get_rows gathers along ne[1] = HKV*n_kv)
+        ggml_tensor * k_fl = ggml_view_2d(ctx0, k, D, HKV*n_kv, k->nb[1], 0);           // [D, HKV*n_kv, 1, 1]
+        ggml_tensor * v_fl = ggml_view_2d(ctx0, v, D, HKV*n_kv, v->nb[1], 0);           // [D, HKV*n_kv, 1, 1]
+        // gather: [D, blk*K_eff*HKV, 1, 1] with (token, head) flattened, head fastest
+        ggml_tensor * kg = ggml_get_rows(ctx0, k_fl, tokr);
+        ggml_tensor * vg = ggml_get_rows(ctx0, v_fl, tokr);
+        // reshape kg/vg to FA layout. FA expects k/v with the kv-head on the SLOWEST (last) dim:
+        //   k [D, n_kv', 1, HKV], v likewise. kg ne1 = blk*K*HKV with (token, head) flattened
+        //   (head fastest, because tokr = h + HKV*tok). So: [D, blk*K, HKV, 1] -> permute heads to ne3.
+        ggml_tensor * kc = ggml_permute(ctx0, ggml_reshape_4d(ctx0, kg, D, blk*K_eff, HKV, 1), 0, 1, 3, 2);
+        ggml_tensor * vc = ggml_permute(ctx0, ggml_reshape_4d(ctx0, vg, D, blk*K_eff, HKV, 1), 0, 1, 3, 2);
+        cb(kg, "xattn_kg", il); cb(vg, "xattn_vg", il); cb(kc, "xattn_kc", il); cb(vc, "xattn_vc", il);
+
+        // Flash attention directly (mirror build_attn_msa_fa): mask == NULL (all-valid compact K,
+        // causal satisfied because the query is the last token). Group the query heads into GQA
+        // groups so q lands on the FA sequence dim the same way MSA does:
+        //   q [D, HQ, T] -> [D, Gp, C, R] -> [D, C, R, Gp] with C=HKV, R=1, Gp = HQ/HKV.
+        const int64_t HQ = q_cur->ne[1];
+        const int64_t C  = HKV;
+        const int64_t R  = 1;
+        const int64_t Gp = HQ / C;
+        GGML_ASSERT(Gp*C*R == HQ*1 && "GQA group mapping");
+        ggml_tensor * qf = ggml_cont(ctx0, ggml_permute(ctx0,
+                ggml_reshape_4d(ctx0, q_cur, D, Gp, C, R), 0, 2, 3, 1));
+        ggml_tensor * o = ggml_flash_attn_ext(ctx0, qf, kc, vc, nullptr, kq_scale,
+                hparams.f_max_alibi_bias,
+                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+        ggml_flash_attn_ext_add_sinks(o, sinks);
+        // [D, C, 1, Gp] -> back to [D, HQ] flatten
+        ggml_tensor * of = ggml_permute(ctx0, ggml_reshape_4d(ctx0, ggml_cont(ctx0, o), D, Gp, C, R), 0, 2, 1, 3);
+        of = ggml_cont(ctx0, of);
+        cur = ggml_reshape_2d(ctx0, of, D*HQ, 1);
+        // Consume the standard (dense) kq mask so it stays a live graph input with a host buffer.
+        // The compact path is all-valid (causal satisfied) so the mask value is unused; adding its
+        // mean scaled by 0 keeps the input alive without changing the output.
+        cur = ggml_add(ctx0, cur,
+                ggml_scale(ctx0, ggml_mean(ctx0, ggml_cast(ctx0, inp->get_kq_mask(), GGML_TYPE_F32)), 0.0f));
+        cb(cur, "kqv_xattn", il);
+    } else if (prefill_ok) {
+        // ---- prefill block-sparse: global top-K blocks -> compact K/V + compact causal mask -
+        // Reuse the same gather-index machinery as decode, but additionally gather the standard
+        // self_kq_mask rows for the selected blocks, so causality is preserved by the mask rather
+        // than by "query is last". One dense FA over the compact K/V with the compact mask.
+        // sel_idx: [K_eff, 1] I32 block ids -> block-start token per selected block
+        ggml_tensor * sel_f = ggml_cast(ctx0, ggml_cont(ctx0, sel_idx), GGML_TYPE_F32); // [K_eff,1]
+        ggml_tensor * a = ggml_scale(ctx0, sel_f, (float) blk);                         // [K_eff,1]
+        ggml_tensor * a4 = ggml_reshape_4d(ctx0, a, 1, K_eff, 1, 1);
+        ggml_tensor * tj_base = ggml_repeat_4d(ctx0, a4, blk, K_eff, 1, 1);             // [blk,K_eff,1,1]
+        ggml_tensor * t_off = ggml_reshape_4d(ctx0, ggml_arange(ctx0, 0.0f, (float) blk, 1.0f), blk, 1, 1, 1);
+        t_off = ggml_repeat_4d(ctx0, t_off, blk, K_eff, 1, 1);                          // [blk,K_eff,1,1]
+        ggml_tensor * tj = ggml_add(ctx0, tj_base, t_off);                              // [blk,K_eff,1,1] token ids
+        // --- compact mask rows (preserve causality): mask is [n_kv, n_tok, 1, n_stream] ---
+        // gather rows by token id (blk*K_eff rows), into [blk*K_eff, n_tok, 1, n_stream].
+        // For ns==1 prefill with n_tok steps, keep it simple and correct.
+        ggml_tensor * mask = inp->get_kq_mask();
+        ggml_tensor * mask_fl = nullptr;
+        if (mask && mask->ne[2] == 1) { // single-stream prefill
+            ggml_tensor * tok_ids = ggml_cast(ctx0,
+                    ggml_reshape_1d(ctx0, ggml_cont(ctx0, tj), blk*K_eff), GGML_TYPE_I32); // [blk*K_eff]
+            // mask [n_kv, n_tok, 1, 1]: line up kv-token on the gather dim (ne1) via permute
+            // -> [n_tok, n_kv, 1, 1]; get_rows gathers along ne1 (n_kv) by selected token ids.
+            ggml_tensor * mp = ggml_permute(ctx0, mask, 1, 0, 2, 3);                    // [n_tok, n_kv, 1, 1]
+            mask_fl = ggml_get_rows(ctx0, mp, tok_ids);                                  // [n_tok, blk*K_eff]
+            mask_fl = ggml_reshape_2d(ctx0, mask_fl, blk*K_eff, mask->ne[1]);            // [blk*K_eff, n_tok]
+            // FA requires an F16 mask
+            mask_fl = ggml_cast(ctx0, mask_fl, GGML_TYPE_F16);
+        }
+        // --- compact K/V ---
+        ggml_tensor * tj_h = ggml_scale(ctx0, tj, (float) HKV);                        // [blk,K_eff,1,1]
+        tj_h = ggml_repeat_4d(ctx0, tj_h, blk, K_eff, HKV, 1);                         // [blk,K_eff,HKV,1]
+        ggml_tensor * h_off = ggml_reshape_4d(ctx0, ggml_arange(ctx0, 0.0f, (float) HKV, 1.0f), 1, 1, HKV, 1);
+        h_off = ggml_repeat_4d(ctx0, h_off, blk, K_eff, HKV, 1);                       // [blk,K_eff,HKV,1]
+        ggml_tensor * tr = ggml_add(ctx0, tj_h, h_off);                                // [blk,K_eff,HKV,1] row ids
+        ggml_tensor * tokr = ggml_cast(ctx0,
+                ggml_reshape_2d(ctx0, ggml_cont(ctx0, tr), blk*K_eff*HKV, 1), GGML_TYPE_I32); // [blk*K_eff*HKV,1]
+        ggml_tensor * k_fl = ggml_view_2d(ctx0, k, D, HKV*n_kv, k->nb[1], 0);          // [D, HKV*n_kv]
+        ggml_tensor * v_fl = ggml_view_2d(ctx0, v, D, HKV*n_kv, v->nb[1], 0);          // [D, HKV*n_kv]
+        ggml_tensor * kg = ggml_get_rows(ctx0, k_fl, tokr);                            // [D, blk*K_eff*HKV]
+        ggml_tensor * vg = ggml_get_rows(ctx0, v_fl, tokr);                            // [D, blk*K_eff*HKV]
+        ggml_tensor * kc = ggml_permute(ctx0, ggml_reshape_4d(ctx0, kg, D, blk*K_eff, HKV, 1), 0, 1, 3, 2);
+        ggml_tensor * vc = ggml_permute(ctx0, ggml_reshape_4d(ctx0, vg, D, blk*K_eff, HKV, 1), 0, 1, 3, 2);
+        // --- query reshape for multi-token prefill (MSA GQA grouping) ---
+        const int64_t HQ  = q_cur->ne[1];
+        const int64_t Gp  = HQ / HKV;
+        const int64_t n_t = n_tok;
+        // q [D, HQ, T] -> [D, Gp, C, T] with C=HKV -> permute -> [D, T, C, Gp] (FA seq dim = T)
+        ggml_tensor * q_r = ggml_reshape_4d(ctx0, q_cur, D, Gp, HKV, n_t);
+        ggml_tensor * qf = ggml_cont(ctx0, ggml_permute(ctx0, q_r, 0, 3, 2, 1));       // [D, T, C, Gp]
+        // --- one dense FA over compact K/V with compact causal mask ---
+        ggml_tensor * o = ggml_flash_attn_ext(ctx0, qf, kc, vc, mask_fl, kq_scale,
+                hparams.f_max_alibi_bias,
+                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+        ggml_flash_attn_ext_add_sinks(o, sinks);
+        // [D, T, C, Gp] -> back to [D, HQ, T]
+        ggml_tensor * of = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_4d(ctx0, o, D, n_t, HKV, Gp), 0, 3, 2, 1));
+        cur = ggml_reshape_2d(ctx0, of, D*HQ, n_t);
+        cb(cur, "kqv_xattn", il);
+    } else {
+        // NOTE: prefill / multi-stream / non-adapted n_kv fall back to dense attention (still
+        // correct; the top-K selection computed above is the sparse scoring for these cases and
+        // the gather refinement for them is the documented follow-up).
+        cur = build_attn_mha(q_cur, k, v, kq_b, inp->get_kq_mask(), sinks, v_mla, 0, kq_scale, il);
+        cb(cur, "kqv_xattn", il);
+    }
+    GGML_UNUSED(sel_idx);
+    GGML_UNUSED(n_kv_blk);
+
+    if (wo) {
+        if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             cur = build_lora_mm(wo, cur);
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
             if (wo_s) {

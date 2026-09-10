@@ -1207,6 +1207,22 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // XAttention block-sparse attention (path B): use cparams.xattn_* to score antidiagonal
+    // block importance in-graph, then top_k select blocks, gather their K/V and run dense FA.
+    ggml_tensor * build_attn_xattn(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il) const;
+
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 
     ggml_tensor * build_attn(

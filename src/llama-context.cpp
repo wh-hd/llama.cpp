@@ -229,6 +229,11 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
+    cparams.xattn         = params.xattn;
+    cparams.xattn_stride  = params.xattn_stride;
+    cparams.xattn_block   = params.xattn_block;
+    cparams.xattn_n_blocks= params.xattn_n_blocks;
+
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = false;
@@ -3628,6 +3633,10 @@ llama_context_params llama_context_default_params() {
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
         /*.attention_type              =*/ LLAMA_ATTENTION_TYPE_UNSPECIFIED,
         /*.flash_attn_type             =*/ LLAMA_FLASH_ATTN_TYPE_AUTO,
+        /*.xattn                       =*/ false,
+        /*.xattn_stride                =*/ 8,
+        /*.xattn_block                 =*/ 128,
+        /*.xattn_n_blocks              =*/ 4,
         /*.rope_freq_base              =*/ 0.0f,
         /*.rope_freq_scale             =*/ 0.0f,
         /*.yarn_ext_factor             =*/ -1.0f,

@@ -43,6 +43,8 @@ add_library(llama
             unicode-data.cpp
             unicode.cpp
             unicode.h
+            xattn-score.cpp
+            xattn-score.h
             ${LLAMA_MODELS_SOURCES}
             )
 

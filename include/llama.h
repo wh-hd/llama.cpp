@@ -373,6 +373,12 @@ extern "C" {
         enum llama_attention_type    attention_type;    // attention type to use for embeddings
         enum llama_flash_attn_type   flash_attn_type;   // when to enable Flash Attention
 
+        // XAttention block-sparse attention (path B: score -> top_k -> gather -> dense FA)
+        bool     xattn;          // enable XAttention block selection
+        int32_t  xattn_stride;   // antidiagonal importance sampling stride (S)
+        int32_t  xattn_block;    // token-block granularity
+        int32_t  xattn_n_blocks; // #kv blocks kept per query block (top_k budget)
+
         // ref: https://github.com/ggml-org/llama.cpp/pull/2054
         float    rope_freq_base;   // RoPE base frequency, 0 = from model
         float    rope_freq_scale;  // RoPE frequency scaling factor, 0 = from model
