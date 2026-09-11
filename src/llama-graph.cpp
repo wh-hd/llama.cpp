@@ -2986,13 +2986,13 @@ ggml_tensor * llm_graph_context::build_attn_xattn(
 
     ggml_tensor * cur;
 
-    // ---- decode (single query at the end) block gather -> compact K/V -> dense FA ----
-    // Causality is trivially satisfied because the query is the last token, so every selected
-    // historical block is addressable. Gating keeps prefill / multi-stream / non-divisible n_kv
-    // on the dense path (still correct, just not sparse).
-    const bool decode_and_ok =
-            n_tok == 1 && ns == 1 && n_kv >= blk && n_kv % blk == 0 && K_eff >= 1
-            && (int64_t) mctx_cur->get_n_kv() == n_kv;   // only when cache is full to the graph bound
+    // ---- decode is intentionally NOT compressed ----
+    // Decode is the generation / reply phase: each token attends over the ENTIRE context so
+    // generation quality is preserved ("decode 不该压缩"). Block-sparse compression applies to
+    // PRE-FILL only (see prefill_ok below): support longer input context and speed up prompt
+    // processing (pp) without degrading the final model. Decode therefore always takes the
+    // dense path, so its attention is never reduced and generation is unaffected.
+    const bool decode_and_ok = false;
     // prefill compact path: multiple query tokens, single stream, divisible, cache full.
     // Causality is preserved by gathering the standard self_kq_mask rows, not by "query is last".
     const bool prefill_ok =
