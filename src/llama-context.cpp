@@ -273,7 +273,6 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
-    cparams.fastkv_enable = params.fastkv_enable;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -1854,9 +1853,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        // (FastKV compression is deferred to the end of this batch loop, after
-        // the logits/embeddings have been extracted from the scheduler, so that
-        // the device-side compaction graph can safely reset/re-use the sched.)
+        // FastKV: compress the KV cache once, at the END of prefill (the last
+        // ubatch with n_tokens > 1). For proportional mode this matters: we must
+        // size the budget from the FINAL prefill length, not compress after every
+        // intermediate ubatch (which would over-prune across multiple crops).
+        // Works on both plain KV caches and the attention KV cache of hybrid
+        // architectures (e.g. Qwen3.6).
+        const bool last_ubatch = (n_tokens_prev + (int64_t) ubatch.n_tokens >= n_tokens_all);
+        if (ubatch.n_tokens > 1 && last_ubatch) {
+            llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+            if (!kv) {
+                if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+                    kv = hybrid->get_mem_attn();
+                }
+            }
+            if (kv && kv->get_fastkv().enable) {
+                LLAMA_LOG_INFO("%s: FastKV trigger on %u seqs (n_tokens=%u, last prefill ubatch)\n",
+                               __func__, ubatch.n_seqs_unq, ubatch.n_tokens);
+                for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+                    kv->fastkv_compact(ubatch.seq_id_unq[s]);
+                }
+            }
+        }
 
         // plot the computation graph in dot format (for debugging purposes)
         //if (n_past%100 == 0) {
@@ -1979,97 +1997,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
-
-        // FastKV: compress the KV cache exactly once, at the END of prefill (the
-        // last ubatch with n_tokens > 1). Deferred to here -- after logits /
-        // embeddings / sampled probs have already been extracted from the
-        // scheduler -- so the device-side compaction graph can reset and re-use
-        // the sched without corrupting the current batch's backend allocations.
-        // The budget is sized from the FINAL prefill length (not per intermediate
-        // ubatch, which would over-prune across multiple crops). Works on both
-        // plain KV caches and the attention KV cache of hybrid architectures.
-        const bool last_ubatch = (n_tokens_prev >= n_tokens_all); // n_tokens_prev already includes this ubatch
-        {
-            llama_kv_cache * kv0 = dynamic_cast<llama_kv_cache *>(memory.get());
-            if (!kv0) {
-                if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
-                    kv0 = hybrid->get_mem_attn();
-                }
-            }
-            LLAMA_LOG_INFO("[fk-dbg] last_ubatch=%d n_tokens=%u n_tokens_all=%lld n_tokens_prev=%lld fastkv_enable=%d\n",
-                           (int)last_ubatch, ubatch.n_tokens, (long long)n_tokens_all, (long long)n_tokens_prev,
-                           kv0 ? (int)(kv0->get_fastkv().enable) : -1);
-        }
-        if (ubatch.n_tokens > 1 && last_ubatch) {
-            llama_kv_cache * kv = dynamic_cast<llama_kv_cache *>(memory.get());
-            if (!kv) {
-                if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
-                    kv = hybrid->get_mem_attn();
-                }
-            }
-            if (kv && kv->get_fastkv().enable) {
-                LLAMA_LOG_INFO("%s: FastKV trigger on %u seqs (n_tokens=%u, last prefill ubatch)\n",
-                               __func__, ubatch.n_seqs_unq, ubatch.n_tokens);
-
-                // [stage-2] read back the per-layer saliency captured in the last
-                // prefill ubatch, average it across attention layers into one
-                // per-position score vector, and compact the KV cache from it
-                // (REAL attention scores instead of the CPU approximated scorer).
-                std::vector<float> sal_all;
-                size_t sal_layers = 0;
-                if (res) {
-                    const uint32_t n_layer_fk = model.hparams.n_layer();
-                    for (uint32_t il = 0; il < n_layer_fk; ++il) {
-                        ggml_tensor * kq = res->t_fastkv_kq[il];
-                        if (!kq) {
-                            continue; // not an attention layer / not captured
-                        }
-                        // kq: [n_kv, n_tokens, n_head, n_stream]
-                        const size_t n_kv  = (size_t) kq->ne[0];
-                        const size_t n_tok = (size_t) kq->ne[1];
-                        const size_t n_hd  = (size_t) kq->ne[2];
-                        const size_t n_st  = (size_t) kq->ne[3];
-                        const size_t total = n_kv * n_tok * n_hd * n_st;
-                        if (total == 0) {
-                            continue;
-                        }
-                        std::vector<float> kbuf(total);
-                        ggml_backend_tensor_get(kq, kbuf.data(), 0, total * sizeof(float));
-                        std::vector<float> sal(n_kv, 0.0f);
-                        for (size_t h = 0; h < n_hd; ++h) {
-                            for (size_t j = 0; j < n_tok; ++j) {
-                                const size_t base = h * n_kv * n_tok + j * n_kv;
-                                for (size_t i = 0; i < n_kv; ++i) {
-                                    sal[i] += kbuf[base + i];
-                                }
-                            }
-                        }
-                        // accumulate across layers (by position)
-                        if (sal_all.size() < n_kv) {
-                            sal_all.resize(n_kv, 0.0f);
-                        }
-                        for (size_t i = 0; i < n_kv; ++i) {
-                            sal_all[i] += sal[i];
-                        }
-                        sal_layers++;
-                    }
-                    // average across layers
-                    if (sal_layers > 0) {
-                        for (auto & v : sal_all) {
-                            v /= (float) sal_layers;
-                        }
-                    }
-                }
-
-                for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
-                    if (sal_layers > 0 && !sal_all.empty()) {
-                        kv->fastkv_compact_from_saliency(ubatch.seq_id_unq[s], sal_all, this);
-                    } else {
-                        kv->fastkv_compact(ubatch.seq_id_unq[s], nullptr, this);
-                    }
-                }
-            }
-        }
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith

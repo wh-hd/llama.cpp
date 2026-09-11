@@ -904,16 +904,6 @@ public:
 
     std::vector<ggml_tensor *> t_layer_inp;
 
-    // FastKV per-layer key-saliency (sum of softmax attention weights each KV
-    // token receives), captured during prefill for single-and multi-ubatch
-    // accumulation. Indexed by layer il; null for non-attention (recr) layers.
-    std::vector<ggml_tensor *> t_fastkv_sal;
-
-    // [debug] raw softmax attention scores captured per layer during prefill,
-    // kept for analyzing the effective-vs-padded key layout before finalizing
-    // the per-key saliency reduction.
-    std::vector<ggml_tensor *> t_fastkv_kq;
-
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;

@@ -226,30 +226,7 @@ public:
 
     // compress the KV cache of the given sequence using the FastKV scorer
     // returns true if compaction happened, false otherwise (e.g. disabled / too short)
-    // if keep_override is non-null, it is used as the surviving cell list
-    // (physical cell indices, position order) instead of the internal
-    // approximated scorer -- used to feed the REAL per-key saliency captured
-    // during prefill directly into compaction. When lctx is non-null the
-    // physical K/V reorder is done with a device-side gather graph (no host
-    // round-trip); otherwise it falls back to the host memcpy path.
-    bool fastkv_compact(llama_seq_id seq_id, const std::vector<uint32_t> * keep_override = nullptr,
-                        llama_context * lctx = nullptr);
-
-    // build a device-side graph that gathers the surviving (`kept`) KV columns
-    // of every layer to the front of the cache (in-place), replacing the host
-    // round-trip physical compaction. kept is indexed per cell column of stream
-    // `strm`. Called by fastkv_compact when lctx is available; the returned
-    // graph is executed via the caller's sched + graph_compute.
-    ggml_cgraph * build_graph_compact(llm_graph_result * res, uint32_t strm,
-                                      const std::vector<uint32_t> & kept) const;
-
-    // compress using a per-key saliency vector (REAL softmax attention, captured
-    // during prefill and reduced on the host). saliency[i] is the saliency of the
-    // i-th KV position of this sequence. The top-(budget-window) saliency keys
-    // plus the trailing window are retained (FastKV policy), replacing the
-    // internal approximated scorer. Returns true if compaction happened.
-    bool fastkv_compact_from_saliency(llama_seq_id seq_id, const std::vector<float> & saliency,
-                                      llama_context * lctx = nullptr);
+    bool fastkv_compact(llama_seq_id seq_id);
 
     // compute the surviving cell indices for the sequence under the FastKV
     // scoring policy (top-(budget-window) + trailing window). returns {} when
@@ -272,11 +249,6 @@ public:
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
-
-    // fill host index tensors for the device-side compaction graph
-    // (see build_graph_compact / llm_graph_input_compact).
-    void set_compact_input_k(ggml_tensor * dst, const std::vector<uint32_t> & kept) const;
-    void set_compact_input_v(ggml_tensor * dst, uint32_t strm, const std::vector<uint32_t> & kept) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
 

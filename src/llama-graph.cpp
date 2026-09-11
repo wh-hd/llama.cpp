@@ -1303,12 +1303,6 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
-    t_fastkv_sal.resize(LLAMA_MAX_LAYERS + 1);
-    std::fill(t_fastkv_sal.begin(), t_fastkv_sal.end(), nullptr);
-
-    t_fastkv_kq.resize(LLAMA_MAX_LAYERS + 1);
-    std::fill(t_fastkv_kq.begin(), t_fastkv_kq.end(), nullptr);
-
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -2526,14 +2520,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    // FastKV (Scheme A) per-layer KV retention needs the real softmax attention
-    // scores during prefill to score key saliency. Flash attention is a fused
-    // kernel that does not expose the score matrix, so we fall back to the
-    // non-flash path during prefill on attention layers when FastKV is enabled.
-    // Decoding (single token) keeps flash attention for speed; the KV is already
-    // compressed by then and no score capture happens there.
-    const bool fastkv_prefill_capture = cparams.fastkv_enable && ubatch.n_tokens > 1 && !hparams.is_recr(il);
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && !fastkv_prefill_capture;
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -2613,19 +2600,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
         ggml_soft_max_add_sinks(kq, sinks);
         cb(kq, "kq_soft_max", il);
-
-        // FastKV per-layer KV retention: capture the real softmax attention
-        // scores (kq) at every attention layer during prefill. The per-key
-        // saliency is reduced on the host from these raw scores (real attention
-        // weights, decoupled from TSP / flash). Non-attention (recurrent)
-        // layers have no softmax attention; skipped.
-        if (cparams.fastkv_enable && !hparams.is_recr(il) && ubatch.n_tokens > 1 && (size_t) il < res->t_fastkv_kq.size()) {
-            // force contiguous so the host readback is byte-exact
-            ggml_tensor * kq_cap = ggml_cont(ctx0, kq);
-            cb(kq_cap, "fastkv_kq_captured", il);
-            res->t_fastkv_kq[il] = kq_cap;
-            ggml_build_forward_expand(gf, kq_cap);
-        }
 
         if (!v_trans) {
             // note: avoid this branch

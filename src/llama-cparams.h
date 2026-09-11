@@ -54,11 +54,6 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
-    // FastKV KV-compression master switch (Scheme A). Mirrored from
-    // llama_context_params so the graph builder can gate per-layer
-    // attention-saliency capture during prefill.
-    bool fastkv_enable = false;
-
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;
